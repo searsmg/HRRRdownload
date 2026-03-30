@@ -20,12 +20,12 @@ library(tictoc)
 ```{r}
 
 # Timeframe to download
-startDate <- ymd('2025-05-31')
-endDate <- ymd('2025-10-01')
+startDate <- ymd('2023-05-31')
+endDate <- ymd('2023-10-01')
 hours <- sprintf("%02d", 0:23)
 
 # Location to save grib2
-localFolder <- "/Users/megansears/Documents/ARS/HRRR/HRRR25"
+localFolder <- "/Volumes/Sears_ARS/HRRR23"
 
 # Number of cores to use for download
 cores <- 8
@@ -35,6 +35,8 @@ cores <- 8
 # Pull HRRR from S3 bucket
 
 ```{r}
+
+tic()
 
 # Download function
 downloadHRRR <- function(date, hour) {
@@ -54,7 +56,7 @@ downloadHRRR <- function(date, hour) {
   if (!file.exists(local_file)) {
     tryCatch({
       
-      Sys.sleep(0.3) # added this so it pauses b/c parallel processing
+      Sys.sleep(1) # added this so it pauses b/c parallel processing
       
       # Export with message
       save_object(
@@ -99,6 +101,8 @@ future_walk(
 # Turn off paralell processing
 plan(sequential)
 
+toc()
+
 ```
 
 # Extract sites from grib2 files
@@ -107,7 +111,7 @@ plan(sequential)
 
 # List files 
 files <- list.files(
-  "/Users/megansears/Documents/ARS/HRRR/HRRR25",
+  "/Volumes/Sears_ARS/HRRR23",
   pattern = "\\.grib2$",
   full.names = T)
 
@@ -150,6 +154,7 @@ extractCells <- function(file,
                          cells, 
                          siteID){
 
+  tryCatch({
   r <- rast(file)
 
   # Extract values via direct indexing
@@ -161,13 +166,18 @@ extractCells <- function(file,
   df$datetime <- dt
 
   df
+}, error = function(e) {
+    message("Error with file: ", file)
+    return(NULL)
+  })
 }
+
 
 # Run the function
 tic("Extract HRRR sites")
 
 plan(multisession, 
-     workers = 8)
+     workers = 4)
 
 final_df <- future_map2_dfr(
   files,
@@ -182,9 +192,14 @@ toc()
 # Go back to sequential
 plan(sequential)
 
+final_df <- final_df %>%
+  relocate(datetime) %>%
+  relocate(siteID,
+           .after=datetime)
+
 # Save dataframe
-write_csv(final_df,
-          "/Users/megansears/Documents/ARS/HRRR/summer21.csv")
+write.csv(final_df,
+          "/Users/megansears/Documents/ARS/HRRR/summer2023.csv")
 
 ```
 
