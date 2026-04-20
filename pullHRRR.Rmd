@@ -20,12 +20,12 @@ library(tictoc)
 ```{r}
 
 # Timeframe to download
-startDate <- ymd('2023-05-31')
-endDate <- ymd('2023-10-01')
+startDate <- ymd('2023-06-02')
+endDate <- ymd('2023-06-02')
 hours <- sprintf("%02d", 0:23)
 
 # Location to save grib2
-localFolder <- "/Volumes/Sears_ARS/HRRR23"
+localFolder <- "/Users/megansears/Documents/ARS/HRRR/test"
 
 # Number of cores to use for download
 cores <- 8
@@ -203,4 +203,31 @@ write.csv(final_df,
 
 ```
 
+# Testing
+
+Checking random timesteps 
+
+```{r}
+
+# Read csv w/ coordinates
+sites <- read_csv("/Users/megansears/Documents/ARS/HRRR/AmeriFlux_Sites_SKP.csv")
+
+# Convert to spatvector
+sitesSpat <- vect(
+  sites,
+  geom = c("lon","lat"),
+  crs = "EPSG:4326")
+
+# pull in a random raster
+test21 <- rast('/Users/megansears/Documents/ARS/HRRR/test/hrrr_20230602_04z.grib2')
+
+sitesProj <- project(sitesSpat, 
+                      crs(test21))
+
+
+extract <- terra::extract(test21, sitesProj)
+
+extract
+
+```
 
