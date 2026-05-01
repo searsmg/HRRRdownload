@@ -1,0 +1,287 @@
+---
+title: "HRRR smoke for 1000 and 6000 ft"
+output: html_document
+---
+
+Extract **1000 ft** and **6000 ft AGL smoke mass density** (MASSDEN) from HRRR
+at weather station locations.
+
+Output CSV columns: `datetime`, `siteID`, `smoke1000`, `smoke6000` (units: μg/m³)
+
+```{r setup, message=FALSE, warning=FALSE}
+
+library(httr)
+library(terra)
+library(tidyverse)
+library(tictoc)
+
+```
+
+# Setup
+
+```{r config}
+
+stations <- "/Users/megansears/Documents/ARS/HRRR/AmeriFlux_Sites_SKP.csv" # needs lat, lon, siteID
+start_date <- ymd_h("2021-05-31 00") # UTC
+end_date <- ymd_h("2021-10-01 12") # UTC,
+fxx<- c(0) # forecast hour 0 means model's estimate, not a forecast
+interval_hr <- 1 # timestep
+output <- "smoke_test.csv"
+
+# HRRR hybrid sigma level numbers (1=top, 50=near surface)
+# From HRRR published eta level table:
+#   Level 42 ≈ 306 m AGL (~1000 ft)
+#   Level 29 ≈ 1863 m AGL (~6000 ft)
+level1000 <- 5
+level6000 <- 11
+
+# Units are in kg/m3
+
+```
+
+# Load Stations
+
+```{r load-stations}
+
+stations_df <- read_csv(stations)
+
+```
+
+# Helper Functions
+
+```{r helpers}
+
+# Build the HRRR AWS S3 URL for a given date, forecast hour, and product
+hrrr_url <- function(date, fxx, product = "nat") {
+  date_str <- format(date, "%Y%m%d")
+  hour_str <- format(date, "%H")
+  fxx_str  <- sprintf("%02d", fxx)
+  paste0(
+    "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.", date_str,
+    "/conus/hrrr.t", hour_str, "z.wrf", product, "f", fxx_str, ".grib2"
+  )
+}
+
+# Download and parse the HRRR .idx file into a data frame
+parse_idx <- function(url) {
+  idx_url <- paste0(url, ".idx")
+  lines <- tryCatch(readLines(idx_url, warn = FALSE), error = function(e) NULL)
+  if (is.null(lines)) return(NULL)
+
+  # idx format: msg_num:byte_start:d=YYYYMMDDHH:variable:level:fcst_type:
+  parts <- strsplit(lines, ":")
+  df <- data.frame(
+    byte_start = as.numeric(sapply(parts, `[`, 2)),
+    variable   = trimws(sapply(parts, `[`, 4)),
+    level      = trimws(sapply(parts, `[`, 5)),
+    stringsAsFactors = FALSE
+  )
+  # End byte = start of next message minus 1 (last message reads to EOF)
+  df$byte_end <- c(df$byte_start[-1] - 1, NA)
+  df
+}
+
+# Download a single GRIB2 message via HTTP byte-range request
+download_grib_message <- function(url, byte_start, byte_end) {
+  range_str <- if (!is.na(byte_end)) {
+    paste0("bytes=", byte_start, "-", byte_end)
+  } else {
+    paste0("bytes=", byte_start, "-")
+  }
+  tmpfile <- tempfile(fileext = ".grib2")
+  resp <- GET(url, add_headers(Range = range_str), write_disk(tmpfile, overwrite = TRUE))
+  stop_for_status(resp)
+  tmpfile
+}
+
+# Fetch a variable at one hybrid level; returns a terra SpatRaster
+fetch_level <- function(url, idx, variable, hybrid_level) {
+  target <- paste0(hybrid_level, " hybrid level")
+  row <- idx[grepl(variable, idx$variable, ignore.case = TRUE) &
+               idx$level == target, ]
+
+  if (nrow(row) == 0) {
+    warning(variable, " at '", target, "' not found in index")
+    return(NULL)
+  }
+
+  tmpfile <- download_grib_message(url, row$byte_start[1], row$byte_end[1])
+  terra::rast(tmpfile)
+}
+
+# Extract raster values at station locations (nearest neighbor)
+extract_at_stations <- function(r, sv) {
+  vals <- terra::extract(r, sv)
+  vals[[2]]  # first col is ID, second is the value
+}
+
+```
+
+# Verify Hybrid Level Heights
+
+Downloads geopotential height (HGT) at all 50 hybrid levels and terrain height
+from the surface product, then calculates AGL height at the center of the HRRR
+grid. Use this to confirm `level1000` and `level6000` are set correctly before
+running the full extraction.
+
+```{r verify, message=FALSE}
+
+url_nat <- hrrr_url(start_date, fxx[1], product = "nat")
+url_sfc <- hrrr_url(start_date, fxx[1], product = "sfc")
+idx_nat  <- parse_idx(url_nat)
+idx_sfc  <- parse_idx(url_sfc)
+
+# Check what height variable is available in the nat file
+hgt_var <- unique(idx_nat$variable[grepl("^HGT$", idx_nat$variable, ignore.case = TRUE)])
+if (length(hgt_var) == 0) {
+  hgt_var <- unique(idx_nat$variable[grepl("HGT|gh|HGHT", idx_nat$variable)])
+}
+cat("Height variable found in nat idx:", paste(hgt_var, collapse = ", "), "\n\n")
+
+# Download terrain height from sfc product
+terrain_var <- unique(idx_sfc$variable[grepl("^HGT$", idx_sfc$variable, ignore.case = TRUE)])[1]
+terrain_row  <- idx_sfc[idx_sfc$variable == terrain_var &
+                          grepl("surface", idx_sfc$level, ignore.case = TRUE), ]
+
+if (nrow(terrain_row) > 0) {
+  r_terrain  <- terra::rast(download_grib_message(url_sfc, terrain_row$byte_start[1],
+                                                   terrain_row$byte_end[1]))
+  # Sample at grid center
+  cx <- ncol(r_terrain) %/% 2
+  cy <- nrow(r_terrain) %/% 2
+  terrain_m <- as.numeric(r_terrain[cy, cx])
+  cat("Terrain height at grid center:", round(terrain_m, 1), "m\n\n")
+} else {
+  terrain_m <- 0
+  cat("Could not find terrain height — using 0 m (sea level assumption)\n\n")
+}
+
+# Download HGT at each hybrid level and compute AGL height at grid center
+if (length(hgt_var) > 0) {
+  agl_results <- data.frame(hybrid_level = integer(), height_agl_m = numeric(),
+                             height_agl_ft = numeric())
+
+  for (lvl in 1:50) {
+    r_hgt <- fetch_level(url_nat, idx_nat, hgt_var[1], lvl)
+    if (is.null(r_hgt)) next
+
+    cx <- ncol(r_hgt) %/% 2
+    cy <- nrow(r_hgt) %/% 2
+    hgt_m   <- as.numeric(r_hgt[cy, cx])
+    agl_m   <- hgt_m - terrain_m
+    agl_ft  <- agl_m * 3.28084
+
+    agl_results <- rbind(agl_results,
+                         data.frame(hybrid_level = lvl,
+                                    height_agl_m  = round(agl_m, 1),
+                                    height_agl_ft = round(agl_ft, 0)))
+  }
+
+  cat("Hybrid level AGL heights at grid center:\n")
+  print(agl_results)
+
+  # Find levels closest to targets
+  closest_1000 <- agl_results[which.min(abs(agl_results$height_agl_m - 305)), ]
+  closest_6000 <- agl_results[which.min(abs(agl_results$height_agl_m - 1829)), ]
+
+  cat("\nClosest level to 1000 ft (305 m):\n"); print(closest_1000)
+  cat("\nClosest level to 6000 ft (1829 m):\n"); print(closest_6000)
+  cat("\nUpdate level1000 and level6000 in the config chunk if needed.\n")
+
+} else {
+  cat("HGT not found in nat idx — cannot verify level heights.\n")
+  cat("Proceeding with level1000 =", level1000, "and level6000 =", level6000, "\n")
+}
+
+```
+
+# (Optional) Inspect Target Levels
+
+Quick check that MASSDEN downloads correctly for the two target levels.
+
+```{r inspect, message=FALSE}
+
+url_test <- hrrr_url(start_date, fxx[1])
+idx_test  <- parse_idx(url_test)
+
+for (lvl_info in list(c("1000 ft", level1000), c("6000 ft", level6000))) {
+  label <- lvl_info[1]
+  level <- as.integer(lvl_info[2])
+  r <- fetch_level(url_test, idx_test, "MASSDEN", level)
+  if (!is.null(r)) {
+    cat(label, "-> hybrid level", level, " | dims:", nrow(r), "x", ncol(r),
+        " | layer name:", names(r), "\n")
+  }
+}
+
+```
+
+# Extract Time Series
+
+```{r extract, message=FALSE}
+
+tic()
+sv <- vect(stations_df, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+all_records <- list()
+
+cycle_times <- seq(start_date, end_date, by = paste(interval_hr, "hours"))
+
+for (dt in cycle_times) {
+  dt <- as_datetime(dt)
+
+  for (f in fxx) {
+    cat("Fetching", format(dt, "%Y-%m-%d %H:%M"), "UTC  fxx=", sprintf("%02d", f), "h ...")
+
+    url <- hrrr_url(dt, f)
+    idx <- parse_idx(url)
+
+    if (is.null(idx)) {
+      cat(" [WARN] could not read index\n")
+      next
+    }
+
+    r_1000 <- fetch_level(url, idx, "MASSDEN", level1000)
+    r_6000 <- fetch_level(url, idx, "MASSDEN", level6000)
+
+    if (is.null(r_1000) || is.null(r_6000)) {
+      cat(" [WARN] one or both levels missing\n")
+      next
+    }
+
+    sv_proj    <- project(sv, crs(r_1000))
+    smoke_1000 <- extract_at_stations(r_1000, sv_proj)
+    smoke_6000 <- extract_at_stations(r_6000, sv_proj)
+
+    valid_time <- dt + hours(f)
+
+    records <- data.frame(
+      datetime  = format(valid_time, "%Y-%m-%d %H:%M:%S"),
+      siteID    = stations_df$siteID,
+      smoke1000 = round(smoke_1000, 10),
+      smoke6000 = round(smoke_6000, 10),
+      stringsAsFactors = FALSE
+    )
+    all_records <- append(all_records, list(records))
+    cat("", nrow(records), "rows\n")
+  }
+}
+
+df_out <- bind_rows(all_records) |>
+  arrange(datetime, siteID)
+
+cat("\nTotal rows:", nrow(df_out), "\n")
+
+toc()
+
+```
+
+# Save & Preview
+
+```{r save}
+
+write_csv(df_out, output)
+
+head(df_out, 20)
+
+```
