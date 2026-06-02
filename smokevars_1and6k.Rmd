@@ -23,14 +23,14 @@ library(tictoc)
 
 stations <- "/Users/megansears/Documents/ARS/HRRR/AmeriFlux_Sites_SKP.csv" # needs lat, lon, siteID
 
-start_date <- ymd_h("2021-05-31 00") # UTC
-end_date <- ymd_h("2021-10-01 23") # UTC,
+start_date <- ymd_h("2025-05-31 00") # UTC
+end_date <- ymd_h("2025-10-01 23") # UTC,
 
 fxx<- c(0) # forecast hour 0 means model's estimate, not a forecast
 
 interval_hr <- 1 # timestep
 
-output <- "smoke_2021.csv"
+output <- "smoke_2025_test.csv"
 
 ```
 
@@ -129,7 +129,15 @@ fetch_level <- function(url, idx, variable, hybrid_level) {
   }
 
   tmpfile <- download_grib_message(url, row$byte_start[1], row$byte_end[1])
-  terra::rast(tmpfile)
+  r <- terra::rast(tmpfile)
+
+  # GRIB2 packing varies by HRRR vintage — GDAL auto-scales some files to ug/m3,
+  # others return raw kg/m3. Metadata is not exposed, so detect by value range:
+  # kg/m3 values are always < 1e-5; ug/m3 values are >> 1e-5.
+  r_max <- global(r, "max", na.rm = TRUE)[[1]]
+  if (!is.na(r_max) && r_max < 1e-5) r <- r * 1e9
+
+  r
 }
 
 ################################################################################
@@ -157,10 +165,26 @@ tibble(
   level = c(level1000, level6000)
 ) %>%
   pwalk(\(label, level) {
-    r <- fetch_level(url_test, idx_test, "MASSDEN", level)
-    if (!is.null(r))
-      cat(label, "-> hybrid level", level, " | dims:", nrow(r), "x", ncol(r),
-          " | layer name:", names(r), "\n")
+    # Download the GRIB2 message directly so we can inspect via describe()
+    target <- paste0(level, " hybrid level")
+    row <- idx_test %>%
+      filter(str_detect(variable, "MASSDEN"), level == target)
+
+    if (nrow(row) == 0) { cat(label, ": not found\n"); return() }
+
+    tmpfile <- download_grib_message(url_test, row$byte_start[1], row$byte_end[1])
+    r <- terra::rast(tmpfile)
+
+    cat(label, "-> hybrid level", level, "\n")
+    cat("  Layer name:", names(r), "\n")
+
+    # GDAL full metadata — look for GRIB_DECIMAL_SCALE_FACTOR or similar
+    cat("  describe() metadata:\n")
+    print(terra::describe(tmpfile, meta = TRUE))
+
+    cx <- ncol(r) %/% 2; cy <- nrow(r) %/% 2
+    cat("  Center pixel:", round(as.numeric(r[cy, cx]), 12), "\n")
+    cat("  Raster min/max:", round(minmax(r), 12), "\n\n")
   })
 
 ```
@@ -199,7 +223,7 @@ fetch_smoke <- function(dt, f) {
   out <- tibble(
     datetime = format(valid_time, "%Y-%m-%d %H:%M:%S"),
     siteID = stations_df$siteID,
-    smoke1000 = round(extract_at_stations(r_1000, sv_proj), 4),  # ug/m3 (terra applies GRIB2 scale on read)
+    smoke1000 = round(extract_at_stations(r_1000, sv_proj), 4),  # ug/m3 (normalized in fetch_level)
     smoke6000 = round(extract_at_stations(r_6000, sv_proj), 4),  # ug/m3
   )
   cat("", nrow(out), "rows\n")
@@ -228,10 +252,8 @@ toc()
 
 ```{r save}
 
-# terra applies GRIB2 scale factor on read, so values are already in ug/m3
+# Values are normalized to ug/m3 in fetch_level; rename columns accordingly
 df_out <- df_out %>%
-  mutate(datetime_utc = as_datetime(datetime)) %>%
-  select(-datetime) %>% 
   rename(smoke1000_ugm3 = smoke1000,
          smoke6000_ugm3 = smoke6000)
 
@@ -241,4 +263,48 @@ write_csv(df_out, output)
 
 ```
 
+# Testing
+
+```{r}
+
+test <- df_out %>%
+  filter(datetime == ymd_hms("2025-06-03 12:00:00",
+                             tz = 'UTC'))
+
+locs_test <- stations_df %>%
+  left_join(test, by = "siteID") %>%
+  vect(geom = c("lon", "lat"), crs = "EPSG:4326")
+
+mapview(locs_test, zcol = "smoke1000_ugm3")
+
+# try to match scale and colors to line up with HRRR smoke graphics
+clevs <- c(1, 2, 4, 6, 8, 12, 16, 20, 25, 30, 40, 60, 100, 200)
+
+smoke_cols <- c(
+  "#f7fbff", "#deebf7", "#9ecae1", "#4292c6", "#2171b5", "#08519c",
+  "#41ab5d", "#addd8e", "#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20",
+  "#bd0026", "#dd3497"
+)
+
+stations_df %>%
+  left_join(test, by = "siteID") %>%
+  ggplot(aes(x = lon, y = lat, fill = smoke1000_ugm3)) +
+  borders("state", colour = "gray70", fill = "white") +
+  geom_point(size = 3, shape = 21, color = "gray30", stroke = 0.4) +
+  scale_fill_stepsn(
+    colors  = smoke_cols,
+    breaks  = clevs,
+    limits  = c(0, 250),
+    name    = "Smoke 1000ft\n(μg/m³)"
+  ) +
+  guides(fill = guide_colorsteps(even.steps = TRUE, 
+                                 barheight = unit(8, "cm"),
+                                 show.limits = TRUE)) +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  labs(title = "HRRR Smoke at 1000ft AGL",
+       subtitle = "2025-06-04 06:00 UTC",
+       x = NULL, y = NULL)
+
+```
 
