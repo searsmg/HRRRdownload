@@ -30,7 +30,7 @@ fxx<- c(0) # forecast hour 0 means model's estimate, not a forecast
 
 interval_hr <- 1 # timestep
 
-output <- "smoke_2025_test.csv"
+output <- "./data/smoke_1and6k_2025.csv"
 
 ```
 
@@ -255,7 +255,8 @@ toc()
 # Values are normalized to ug/m3 in fetch_level; rename columns accordingly
 df_out <- df_out %>%
   rename(smoke1000_ugm3 = smoke1000,
-         smoke6000_ugm3 = smoke6000)
+         smoke6000_ugm3 = smoke6000,
+         datetime_utc = datetime)
 
 summary(df_out)
 
